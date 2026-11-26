@@ -141,7 +141,7 @@ pub(crate) extern "system" fn wait(
     // time-out shorter than a tick) answer as before.
     // `VICTORY_LATE_WAITS=1` sleeps to the next tick, as before.
     static SLEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*SLEEP.get_or_init(|| std::env::var_os("VICTORY_LATE_WAITS").is_some_and(|v| v == "1"))
+    if *SLEEP.get_or_init(|| std::env::var_os("VICTORY_LATE_WAITS").is_some_and(|v| v == "1"))
         && limit >= wait
         && tick > last(kind).load(Ordering::Relaxed) + 1
     {

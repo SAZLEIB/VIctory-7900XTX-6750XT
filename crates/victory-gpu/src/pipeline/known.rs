@@ -122,28 +122,63 @@ pub(super) fn note(key: &str, shaders: &[Arc<Shader>], graphics: Option<&Graphic
     book.added += 1;
 }
 
-/// Writes what was noted.
+/// Writes what was noted, restoring any unwritten batch if disk I/O fails.
 fn flush() {
     let Some(Some(book)) = BOOK.get() else { return };
-    let (dir, new, added) = {
+    let (dir, mut new, added) = {
         let mut book = book.lock().unwrap_or_else(|e| e.into_inner());
         if book.added == 0 {
             return;
         }
         (book.dir.clone(), std::mem::take(&mut book.new), std::mem::take(&mut book.added))
     };
-    for (file, bytes) in [SHADERS, PIPELINES].iter().zip(&new) {
+    for (idx, file) in [SHADERS, PIPELINES].iter().enumerate() {
+        let bytes = &new[idx];
+        if bytes.is_empty() {
+            continue;
+        }
         let written = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(dir.join(file))
             .and_then(|mut f| f.write_all(bytes));
         if let Err(e) = written {
-            tracing::warn!(error = %e, file, "title pipelines not written down");
+            tracing::warn!(error = %e, file, "title pipelines not written down; keeping batch in memory");
+            let mut book = book.lock().unwrap_or_else(|e| e.into_inner());
+            for restore in idx..2 {
+                if !new[restore].is_empty() {
+                    let mut prefix = std::mem::take(&mut new[restore]);
+                    prefix.extend_from_slice(&book.new[restore]);
+                    book.new[restore] = prefix;
+                }
+            }
+            book.added += added;
             return;
         }
+        new[idx].clear();
     }
     tracing::info!(pipelines = added, "title pipelines written down");
+}
+
+/// Whether `key` was marked bad by `victory warm` (`warm-bad.txt`), unless
+/// `VICTORY_IGNORE_BAD_PIPELINES=1`.
+pub(super) fn is_bad(key: &str) -> bool {
+    if std::env::var_os("VICTORY_IGNORE_BAD_PIPELINES").is_some_and(|v| v == "1") {
+        return false;
+    }
+    static BAD: OnceLock<HashSet<String>> = OnceLock::new();
+    let bad = BAD.get_or_init(|| {
+        let Some(dir) = super::library::folder() else {
+            return HashSet::new();
+        };
+        std::fs::read_to_string(dir.join("warm-bad.txt"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.split_whitespace().next())
+            .map(ToOwned::to_owned)
+            .collect()
+    });
+    bad.contains(key)
 }
 
 /// Calls `f` with each container's stage, hash, place and length; where the
