@@ -132,10 +132,11 @@ static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 fn wait_budget() -> Duration {
     static BUDGET: OnceLock<Duration> = OnceLock::new();
     *BUDGET.get_or_init(|| {
+        let default_ms = if crate::host::low_ram_profile() { 150 } else { 500 };
         let millis = std::env::var("VICTORY_PIPELINE_WAIT_MS")
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(500);
+            .unwrap_or(default_ms);
         tracing::info!(millis, "host pipeline wait budget per frame");
         Duration::from_millis(millis)
     })
@@ -146,7 +147,8 @@ fn wait_budget() -> Duration {
 fn screen_budget() -> Duration {
     static BUDGET: OnceLock<Duration> = OnceLock::new();
     *BUDGET.get_or_init(|| {
-        let millis = std::env::var("VICTORY_SCREEN_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(10_000);
+        let default_ms = if crate::host::low_ram_profile() { 1_500 } else { 10_000 };
+        let millis = std::env::var("VICTORY_SCREEN_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default_ms);
         Duration::from_millis(millis)
     })
 }
@@ -299,6 +301,8 @@ fn slow_limit() -> usize {
     *LIMIT.get_or_init(|| {
         if std::env::var_os("VICTORY_PIPELINE_SLOW").is_some_and(|v| v == "0") {
             usize::MAX
+        } else if crate::host::low_ram_profile() {
+            1
         } else {
             (worker_count(None, std::thread::available_parallelism().map_or(2, |n| n.get())) / 4).max(1)
         }

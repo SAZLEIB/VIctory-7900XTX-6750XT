@@ -123,15 +123,32 @@ pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
     (now >> 32).saturating_sub(moment >> 32) >= frames && tenths * 100 >= ms
 }
 
-/// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`.
-pub(crate) fn available_physical_ram() -> Option<u64> {
+fn memory_status() -> Option<(u64, u64)> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // SAFETY: plain data the call fills in.
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
     // SAFETY: a sized structure.
     let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
-    ok.then_some(m.ullAvailPhys)
+    ok.then_some((m.ullTotalPhys, m.ullAvailPhys))
+}
+
+/// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`.
+pub(crate) fn available_physical_ram() -> Option<u64> {
+    memory_status().map(|(_, avail)| avail)
+}
+
+/// Total physical RAM on the host in bytes, cached at first query.
+pub(crate) fn total_physical_ram() -> Option<u64> {
+    static TOTAL: OnceLock<Option<u64>> = OnceLock::new();
+    *TOTAL.get_or_init(|| memory_status().map(|(total, _)| total))
+}
+
+/// True on systems with <= 18 GiB of physical RAM (such as 16 GB PCs) where
+/// idle system-RAM pools should stay compact to avoid OS paging.
+pub(crate) fn low_ram_profile() -> bool {
+    const EIGHTEEN_GIB: u64 = 18 * 1024 * 1024 * 1024;
+    total_physical_ram().is_some_and(|total| total <= EIGHTEEN_GIB)
 }
 
 /// How long host copies of textures the title fills must have been idle to
@@ -434,6 +451,8 @@ fn sweep() {
     crate::book::check();
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
+    trim_spare();
+    crate::shadow::trim_pool();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
@@ -1835,6 +1854,41 @@ const SCRATCH_FIRST: u64 = 256 << 10;
 const SPARE_MOST: u64 = 128 << 20;
 /// The same with [`keep_freed`].
 const SPARE_KEPT: u64 = 1 << 30;
+/// Compact scratch cap for <= 16 GB RAM hosts.
+const SPARE_LOW_RAM: u64 = 64 << 20;
+/// Emergency scratch cap when free physical RAM drops below 3 GiB.
+const SPARE_PRESSURE: u64 = 16 << 20;
+
+fn spare_limit() -> u64 {
+    const THREE_GIB: u64 = 3 * 1024 * 1024 * 1024;
+    if available_physical_ram().is_some_and(|avail| avail < THREE_GIB) {
+        SPARE_PRESSURE
+    } else if low_ram_profile() {
+        SPARE_LOW_RAM
+    } else if keep_freed() {
+        SPARE_KEPT
+    } else {
+        SPARE_MOST
+    }
+}
+
+fn trim_spare() {
+    let limit = spare_limit();
+    let mut freed = Vec::new();
+    {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        while spare.bytes > limit {
+            let Some((chunk, size)) = spare.kept.pop() else { break };
+            spare.bytes = spare.bytes.saturating_sub(size);
+            ALIVE[3].fetch_sub(1, Ordering::Relaxed);
+            ALIVE[4].fetch_sub(size, Ordering::Relaxed);
+            ALIVE[1].fetch_sub(1, Ordering::Relaxed);
+            ALIVE[2].fetch_sub(size, Ordering::Relaxed);
+            freed.push(chunk);
+        }
+    }
+    drop(freed);
+}
 
 /// Whether lists share their scratch chunks: a list takes a chunk when it
 /// first needs one, a small one first, and gives all of them back when it
@@ -1915,7 +1969,7 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                spare.give(chunk, size, if keep_freed() { SPARE_KEPT } else { SPARE_MOST })
+                spare.give(chunk, size, spare_limit())
             } else {
                 Some(chunk)
             };
@@ -8489,6 +8543,7 @@ struct Presenter {
 struct Meter {
     since: std::time::Instant,
     frames: u32,
+    last_frame: u64,
     #[cfg(feature = "diagnostics")]
     copy_stats_frames: u64,
     drawn: u64,
@@ -8503,6 +8558,7 @@ impl Meter {
         Meter {
             since: now,
             frames: 0,
+            last_frame: 0,
             #[cfg(feature = "diagnostics")]
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
@@ -8519,10 +8575,17 @@ impl Meter {
 
     /// Counts a presented frame.
     fn frame(&mut self, hwnd: HWND) {
+        let cur = crate::frame::current();
         #[cfg(feature = "diagnostics")]
-        tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
+        tracing::debug!(target: "victory_gpu::frame", token = cur, "present");
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
+        if self.last_frame > 0 && cur.saturating_sub(self.last_frame) > 30 {
+            crate::pool::room(host().and_then(|h| h.video_memory()));
+            trim_spare();
+            crate::shadow::trim_pool();
+        }
+        self.last_frame = cur;
         self.frames += 1;
         #[cfg(feature = "diagnostics")]
         {

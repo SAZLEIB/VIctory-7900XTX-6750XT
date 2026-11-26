@@ -43,6 +43,7 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
+    lock(&STAGING).rested(now());
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
@@ -180,11 +181,13 @@ struct Pool<B> {
     /// The empty blocks it was last told to keep, and the most it keeps.
     spare: usize,
     most: usize,
+    /// True when blocks live in host system RAM (such as upload staging).
+    system_ram: bool,
 }
 
 impl<B: Clone> Pool<B> {
-    const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most }
+    const fn new(most: usize, system_ram: bool) -> Pool<B> {
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, system_ram }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -283,7 +286,19 @@ impl<B: Clone> Pool<B> {
             }
         }
         // (Without a piece given back too, once there is less room.)
-        let most = SPARES.load(Ordering::Relaxed).min(self.most);
+        let ram_cap = if self.system_ram {
+            const THREE_GIB: u64 = 3 * 1024 * 1024 * 1024;
+            if crate::host::available_physical_ram().is_some_and(|avail| avail < THREE_GIB) {
+                1
+            } else if crate::host::low_ram_profile() {
+                SPARE
+            } else {
+                self.most
+            }
+        } else {
+            self.most
+        };
+        let most = SPARES.load(Ordering::Relaxed).min(ram_cap);
         if any || most < self.spare {
             self.spare = most;
             let mut spare = 0;
@@ -309,8 +324,8 @@ struct Upload(ID3D12Resource, *mut u8);
 // SAFETY: the mapping is written by the owners of its pieces, each its own.
 unsafe impl Send for Upload {}
 
-static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
-static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
+static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT, false));
+static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT, true));
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -562,7 +577,7 @@ mod tests {
 
     #[test]
     fn pieces_never_overlap_and_rest_before_they_are_used_again() {
-        let mut pool: Pool<u32> = Pool::new(SPARE);
+        let mut pool: Pool<u32> = Pool::new(SPARE, false);
         let made = std::cell::Cell::new(0);
         let make = || {
             made.set(made.get() + 1);
@@ -592,13 +607,13 @@ mod tests {
         assert_eq!(pool.blocks(), blocks.min(SPARE));
         // Too big for a block, and a block that cannot be made.
         assert!(pool.take(BLOCK, 65536, 30, make).is_none());
-        let mut none: Pool<u32> = Pool::new(SPARE);
+        let mut none: Pool<u32> = Pool::new(SPARE, false);
         assert!(none.take(65536, 65536, 0, || None).is_none());
     }
 
     #[test]
     fn pieces_come_from_blocks_older_than_the_lists_that_run() {
-        let mut pool: Pool<u64> = Pool::new(SPARE_KEPT);
+        let mut pool: Pool<u64> = Pool::new(SPARE_KEPT, false);
         let made = std::cell::Cell::new(0);
         let make = || {
             made.set(made.get() + 1);

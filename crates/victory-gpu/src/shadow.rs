@@ -1285,27 +1285,57 @@ fn pooled(n: usize) -> Vec<u8> {
 /// [`Shadow::writing`]), and the page faults of filling it.
 fn snapshots_kept() -> usize {
     static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MOST.get_or_init(|| std::env::var("VICTORY_SNAPSHOT_POOL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1024))
+    *MOST.get_or_init(|| {
+        let default = if crate::host::low_ram_profile() { 128 } else { 1024 };
+        std::env::var("VICTORY_SNAPSHOT_POOL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+    })
 }
 
-/// Returns a snapshot buffer to the pool: at most [`snapshots_kept`] kept,
-/// the largest, and of those the largest one and the next ones up to `KEPT`
-/// bytes in all.
-fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(v);
+fn snapshot_pool_bytes_cap() -> usize {
+    const THREE_GIB: u64 = 3 * 1024 * 1024 * 1024;
+    if crate::host::available_physical_ram().is_some_and(|avail| avail < THREE_GIB) {
+        32 << 20
+    } else if crate::host::low_ram_profile() {
+        128 << 20
+    } else {
+        512 << 20
+    }
+}
+
+fn prune_snapshot_pool(pool: &mut Vec<Vec<u8>>, cap: usize) -> Vec<Vec<u8>> {
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
     let (mut kept, mut total) = (0, 0usize);
     for v in pool.iter().take(snapshots_kept()) {
         total = total.saturating_add(v.capacity());
-        if kept > 0 && total > KEPT {
+        if kept > 0 && total > cap {
             break;
         }
         kept += 1;
     }
-    // (Given back to the kernel without the lock: milliseconds.)
-    let gone = pool.split_off(kept);
+    pool.split_off(kept)
+}
+
+/// Trims idle recycled snapshot buffers when host RAM is constrained.
+pub(crate) fn trim_pool() {
+    let cap = snapshot_pool_bytes_cap();
+    let gone = {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.is_empty() {
+            return;
+        }
+        prune_snapshot_pool(&mut pool, cap)
+    };
+    drop(gone);
+}
+
+/// Returns a snapshot buffer to the pool: at most [`snapshots_kept`] kept,
+/// the largest, and of those the largest one and the next ones up to `cap`
+/// bytes in all.
+fn give_back(v: Vec<u8>) {
+    let cap = snapshot_pool_bytes_cap();
+    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    pool.push(v);
+    let gone = prune_snapshot_pool(&mut pool, cap);
     drop(pool);
     drop(gone);
 }
@@ -2534,7 +2564,8 @@ static KEPT_BYTES: AtomicU64 = AtomicU64::new(0);
 fn kept_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_KEEP_SNAPSHOTS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(256) << 20
+        let default_mb = if crate::host::low_ram_profile() { 96 } else { 256 };
+        std::env::var("VICTORY_KEEP_SNAPSHOTS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default_mb) << 20
     })
 }
 
