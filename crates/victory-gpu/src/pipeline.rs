@@ -61,6 +61,10 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
+    /// Whether the container is a BVH update copy pass with no effect when
+    /// the ray-tracing structure builder is off.
+    #[cfg(windows)]
+    bvh_copy: bool,
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
@@ -114,6 +118,9 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
+                #[cfg(windows)]
+                bvh_copy: stage == "compute"
+                    && bytes.windows(b"CopyForBVHUpdate".len()).any(|w| w == b"CopyForBVHUpdate"),
                 #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
                 #[cfg(windows)]
@@ -308,6 +315,13 @@ pub(crate) fn builder_quarantined(this: This) -> bool {
 #[cfg(windows)]
 pub(crate) fn is_builder(this: This) -> bool {
     !this.is_null() && pipeline(this).builder
+}
+
+/// Whether the title's pipeline `this` is a BVH copy pass that only runs
+/// when the ray-tracing structure builder is active.
+#[cfg(windows)]
+pub(crate) fn is_bvh_copy_idle(this: This) -> bool {
+    !this.is_null() && pipeline(this).shaders.iter().any(|s| s.bvh_copy) && !builder_runs()
 }
 
 /// A stage of the builder was dropped after all: none runs for the rest of

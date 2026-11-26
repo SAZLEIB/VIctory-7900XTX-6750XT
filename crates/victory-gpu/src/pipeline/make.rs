@@ -226,18 +226,27 @@ fn wait(p: &Pending, frame: u64) {
     if left.is_zero() {
         return;
     }
+    let cap_ms: u64 = std::env::var("VICTORY_PIPELINE_WAIT_CAP_MS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    let wait_for = if cap_ms > 0 {
+        left.min(Duration::from_millis(cap_ms))
+    } else {
+        left
+    };
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
-        let rest = left.saturating_sub(started.elapsed());
+        let rest = wait_for.saturating_sub(started.elapsed());
         if rest.is_zero() {
             break;
         }
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
     drop(held);
-    let waited = started.elapsed().min(left);
+    let waited = started.elapsed().min(wait_for);
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
             ms = waited.as_millis() as u64,

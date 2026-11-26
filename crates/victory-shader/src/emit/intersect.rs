@@ -123,6 +123,19 @@ impl<'a> Lower<'a> {
             x.push(self.i32_of(v)?);
         }
         let pointer = x[0];
+        if crate::emit::bvh_miss() {
+            let c = self.cur;
+            let (k4, k6) = (self.s.m.i32(4), self.s.m.i32(6));
+            let pair = self.s.m.bin(c, Bin::And, pointer, k6);
+            let is_box = self.s.m.cmp(c, pred::EQ, pair, k4);
+            let none = self.s.m.i32(bvh::NONE);
+            let tri_miss = bvh::MISS.map(|f| self.s.m.i32(f.to_bits()));
+            for k in 0..4 {
+                let val = self.s.m.select(c, is_box, none, tri_miss[k]);
+                self.write(inst, Reg::V(dst + k as u8), val, guard);
+            }
+            return Ok(());
+        }
         let pointer_high = wide.then(|| x[1]);
         let f: Vec<V> = x[1 + usize::from(wide)..]
             .iter()

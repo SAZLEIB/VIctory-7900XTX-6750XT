@@ -50,14 +50,22 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     let bad: HashSet<&str> = bad.lines().filter_map(|l| l.split(' ').next()).collect();
     let early = std::fs::read_to_string(dir.join("early-pipelines.txt")).unwrap_or_default();
     let early: HashSet<&str> = early.lines().collect();
-    // Those earlier runs drew with first, the others in no order (by key).
+    let slow_known = std::fs::read_to_string(dir.join("slow-pipelines.txt")).unwrap_or_default();
+    let slow_known: HashSet<&str> = slow_known.lines().filter_map(|l| l.split_whitespace().next()).collect();
+    // Early ones first, then normal ones, and known slow ones last so fast
+    // pipelines warm the driver cache before heavy ones run.
     let mut all: Vec<usize> = (0..keys.len())
         .filter(|&n| {
             let key = keys[n].as_str();
             (again || !done.contains(key)) && !bad.contains(key) && (!used || early.contains(key))
         })
         .collect();
-    all.sort_by_key(|&n| (!early.contains(keys[n].as_str()), &keys[n]));
+    all.sort_by_key(|&n| {
+        let key = keys[n].as_str();
+        let is_early = early.contains(key);
+        let bucket = if is_early { 0u8 } else if !slow_known.contains(key) { 1u8 } else { 2u8 };
+        (bucket, key)
+    });
     all.truncate(limit.unwrap_or(usize::MAX));
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
     let jobs = jobs.unwrap_or(cores * 2 / 3).max(1);

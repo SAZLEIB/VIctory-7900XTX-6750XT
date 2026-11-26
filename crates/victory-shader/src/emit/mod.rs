@@ -201,6 +201,26 @@ pub fn builder_bounds() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BOUNDS").is_none_or(|v| v != "0"))
 }
 
+/// Whether ray-tracing node tests (`image_bvh*_intersect_ray`) return an
+/// immediate miss without reading acceleration structures (when
+/// `VICTORY_BVH_BUILDER` is not `1`, unless `VICTORY_BVH_MISS=0`). Off in
+/// unit tests so `intersect_tests` exercises the node tests. Part of the
+/// translation: the shader cache keys on it.
+pub fn bvh_miss() -> bool {
+    #[cfg(test)]
+    {
+        false
+    }
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "1")
+                && std::env::var_os("VICTORY_BVH_MISS").is_none_or(|v| v != "0")
+        })
+    }
+}
+
 /// The clean-up passes that run over a translated program before it is
 /// written (`bitcode::opt`): a set of that module's pass bits. Every pass
 /// is exact, so the switch is for telling a translator fault from a

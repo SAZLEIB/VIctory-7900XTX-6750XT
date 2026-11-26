@@ -2623,6 +2623,12 @@ impl State {
             }
             return;
         }
+        if crate::pipeline::is_bvh_copy_idle(self.pipeline as This) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("CopyForBVHUpdate with ray-tracing builder off".to_owned());
+            return;
+        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
@@ -3714,6 +3720,9 @@ impl State {
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            return false;
+        }
+        if crate::pipeline::is_bvh_copy_idle(self.pipeline as This) {
             return false;
         }
         const DRAW: u32 = 0;
